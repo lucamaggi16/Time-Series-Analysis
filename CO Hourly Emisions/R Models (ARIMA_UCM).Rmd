@@ -1,0 +1,431 @@
+---
+title: "Progetto analisi serie storica ossido di carbonio"
+author:
+- Luca Maggi 866654
+output:
+  pdf_document:
+    toc: yes
+    toc_depth: 5
+    latex_engine: xelatex
+  beamer_presentation:
+    colortheme: lily
+    fig_caption: no
+    fig_height: 6
+    fig_width: 10
+    fonttheme: structurebold
+    theme: Hannover
+    toc: yes
+  html_document:
+    df_print: paged
+    toc: yes
+    toc_depth: '5'
+  prettydoc::html_pretty:
+    df_print: paged
+    highlight: vignette
+    theme: cayman
+    toc: yes
+    toc_depth: 5
+  slidy_presentation:
+    highlight: default
+  ioslides_presentation:
+    css:
+    - css/fonts.css
+    - css/custom.css
+    - css/title-slide.css
+    - css/slide-background.css
+    includes:
+      before_body: html/title.html
+    toc: yes
+    transition: default
+    widescreen: yes
+course: Streaming data management and time series analysis
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+# Imports
+
+library(readr)
+library(magrittr)
+library(dplyr)
+library(xts)
+library(lubridate)
+library(forecast)
+library(urca)
+library(readxl)
+library(KFAS)
+library(xts)
+library(splines)
+
+# retrive the dataset
+
+setwd("C:/Users/lucam/Desktop/Uni/Streaming Data Management and Time Series Analysis/Progetto")
+df <- read_csv("Project_data_2021_2022 (TRAINSET).csv", col_types = cols(Date = col_character()))
+df<- as_tibble(df)
+```
+
+```{r ,echo=FALSE}
+
+missing <- df$CO %>% is.na %>% which() # missing values
+date <- as.Date(df$Date) # metto in versione data
+df$Date <- date
+date_months <- months(date) %>% match(month.name) # estraggo mese dai dati
+df$Month <- date_months # creo colonna nel ds solo mesi
+df$Weekday <- weekdays(date)
+
+df_missing <- df %>% slice(missing)
+medie <- df %>% na.omit() %>% group_by(Month, Weekday, Hour) %>% summarise_at(vars(CO), list(CO=mean)) # Creo la media per i mesi ed i giorni della settimana
+
+df_missing$CO <- NULL # drop colonna CO con valori nulli
+df_missing <- df_missing %>% left_join(medie, by = c('Month', 'Weekday', 'Hour')) # unisco con df medie e trovo valori in media
+
+merged_df <- df %>% full_join(df_missing, by = c('Date', 'Hour', 'Month', 'Weekday')) # unisco i df con le medie e quello originale
+
+df <- within(
+  merged_df,{
+    CO <- ifelse(is.na(CO.x), CO.y, CO.x) # creo nuova colonna mettendo i valori in media al posto dei missing values
+    CO.x <- NULL # droppo colonne della join che non servono più
+    CO.y <- NULL
+  }
+)
+
+y = df$CO 
+```
+
+# Introduzione e operazioni preliminari
+
+La serie storica in esame comprende le osservazioni orarie delle emissioni di ossido di carbonio (CO) per il periodo che va dal 10 Marzo 2004, ore 18:00, al 2 Febbraio 2005, ore 23:00. Il totale delle osservazioni è di 8526, tra queste si contano 365 *missing values* da trattare prima di passare alla fase di analisi.
+
+Data la natura della serie in esame nel trattare i valori mancanti è supposta una possibile correlazione tra il valore da sostituire, il mese ed il giorno della settimana in cui questo valore avrebbe dovuto manifestarsi; inoltre, ovviamente, è posta una particolare attenzione all'ora dell'osservazione.
+Partendo da questi presupposti i valori assenti sono sostituiti da una media delle osservazioni aventi questi tre elementi in comune. Per esempio, supponendo mancante l'osservazione di Venerdì 12 Marzo 2004, ore 17:00, il suo sostituto è trovato prendendo la media dei valori registrati alle 17:00 di ogni Venerdì di Marzo.
+Ovviamente, prima di procedere con questa imputazione, è necessario aggiungere una colonna nuova al dataset, contenente i giorni della settimana relativi ad ogni osservazione.
+
+Imputati i valori mancanti la colonna della data, dell'ora e quella dei valori di CO sono trasformate in un unico oggetto *time series* di R per rendere il loro impiego più comodo.
+Alla fine la serie storica in esame risulta la seguente:
+
+```{r ,echo=FALSE}
+df$Hour<-sprintf("%02d:00",df$Hour) # cambio in formato ora corretto
+df$Hour<-format(df$Hour, format= "%H:%M")
+df$DT<-ymd_hm(paste(df$Date, df$Hour)) # metto anno e ora assieme
+
+data_ts <- xts(df$CO, df$DT) #formato serie storica
+plot(data_ts, main='Livelli di CO')
+```
+
+# Modelli ARIMA
+
+Il primo passo per la costruzione di un modello ARMA consiste nello studiare la varianza della serie, che, idealmente, dovrebbe essere costante nel tempo.
+Osservando il grafico precedente è possibile notare come i suoi valori tendano ad aumentare progressivamente. Questo effetto potrebbe essere semplicemente dovuto al passaggio dai mesi estivi a quelli invernali dell'anno;
+logicamente, infatti, avrebbe senso supporre un aumento delle emissioni di CO nei mesi freddi a causa, principalmente, del riscaldamento. Questa teoria è supportata anche dalla presenza di valori più alti nel primo mese della serie, corrispondente a Marzo 2004.
+Malgrado queste considerazioni è comunque indubbia la presenza di una varianza crescente che è opportuno trattare. 
+Ad ulteriore supporto di ciò di seguito è mostrata la relazione tra la media della serie e la sua deviazione standard e, come si può notare, spicca una relazione lineare nel tempo.
+
+```{r ,echo=FALSE}
+dvalues <- df %>% group_by(Date) %>% summarise_at(vars(CO), list(Mean=mean)) # medie giornaliere
+#plot(dvalues$Mean, type='l', main='Media Giornaliera')
+dstd <- df %>% group_by(Date) %>% summarise_at(vars(CO), list(Std=sd)) # Deviazioni standard giornaliere
+dvalues <- dvalues %>% left_join(dstd, by = c('Date'))
+
+
+plot(dvalues$Mean, dvalues$Std, type = 'p', xlab='Mean', ylab='Std', main = 'Mean e Std Correlation')
+abline(lm(dvalues$Std ~ dvalues$Mean), col='red')
+
+```
+
+Una trasformazione di Box-Cox è quindi applicata per cercare di riportare la varianza a valori costanti. In particolare, è utilizzato il pacchetto *forecast* per trovare il valore di lambda ideale da applicare, che risulta essere di circa -0.9. Questa famiglia di trasformazioni è ovviamente invertibile, condizione vitale per poter poi ottenere previsioni sensate rispetto ai valori originali della serie.
+Il grafico della serie corretta per la varianza è riportato di seguito
+
+```{r ,echo=FALSE}
+lambda_y <- forecast::BoxCox(data_ts, lambda= "auto") # lambda = -0.8999268
+plot(lambda_y, main='Serie corretta per la varianza')
+```
+
+Un'analisi del grafico mostra come il problema sia stato alleviato, ma non risolto completamente. Ad ogni modo, dopo varie prove, è bene notare che, empiricamente, i modelli aggiustati per la varianza performano solo leggermente meglio rispetto a quelli che utilizzano la serie pura in questo caso specifico.
+
+Il secondo aspetto da prendere in considerazione è la presenza di una stagionalità. 
+Logicamente è facile intuire la presenza di una stagionalità giornaliera nei dati, questa intuizione è confermata anche dall'osservazione della serie. Un'altra possibile stagionalità è quella settimanale, molto probabilmente, però, questa è solo un multiplo di quella giornaliera e, quindi, risolvere la prima potrebbe portare ad una risoluzione anche della seconda e viceversa.
+Tenendo questo in mente diversi approci sono confrontati per modellare la stagionalità di questa serie; in particolare tre: una differenziazione stagionale, una modellazione mediante variabili *dummies* e una mediante l'uso di sinusoidi.
+In particolare la differenziazione è testata su un periodo di 24 ore, per cercare di eliminare la stagionalità giornaliera, le sinusoidi sono costruite sia con frequenza giornaliera che con frequenza settimanale (168 ore), mentre le dummies sono modellate su ogni giorno della settimana, meno il Giovedì. Nel caso delle *dummies* procedere in questo modo permette di ottenere le stime dell'impatto degli altri giorni della settimana confrontati a quello escluso.
+
+Inizialmente, per comprendere l'influenza e l'entità dei regressori stagionali sulla serie viene sviluppata una semplice regressione lineare. Questo approcio soffre di due problemi principali: per prima cosa la presenza di correlazione nei residui inficia la precisione dei vari statistica test e relativi p-value, secondariamente l'utilizzo di sole componenti deterministiche nella modellazione della serie considera solo una parte della realtà.
+A causa di queste criticità il processo è quindi impiegato solo come mera base intuitiva per orientarsi nella selezione preliminare dei coefficienti.
+Nel performare queste regressioni è ipotizzato anche un trend nella serie, sia in forma normale che quadratica e, pur con le limitazioni di cui sopra, entrambi sono parsi significativi.
+La prima regressione performata comprende le *dummies* settimanali e indica che le uniche significative sono quelle di Lunedì, Sabato e Domenica. Gli altri giorni non hanno riscontrato un comportamento significativamente differente rispetto a quello del Giovedì e, in ottica di parsimoniosità del modello, sono scartate dalle successive analisi.
+In seguito una regressione con le sinusoidi a frequenza giornaliera ed una con le sinusoidi a frequenza settimanale è performata. A livello giornaliero risultano significative solo sei sinusoidi, mentre a livello settimanale fino a 16 portano un certo grado di significatività.
+
+Di seguito è riportata la modellazione della serie originale compiuta sia con variabili *dummies* settimanali, in verde, che con le sinusoidi giornaliere, in rosso; i dati mostrati coprono solo il mese di Aprile per maggiore chiarezza.
+
+```{r ,echo=FALSE}
+t <- 1:length(y) # trend
+t2 <- t^2 # trend quadratico
+
+# dummies settimanali (significative)
+
+Monday <- ifelse(df$Weekday == 'Monday', 1, 0)
+Saturday <- ifelse(df$Weekday == 'Saturday', 1, 0)
+Sunday <- ifelse(df$Weekday == 'Sunday', 1, 0)
+ddummies <- cbind(Monday,Saturday,Sunday)
+
+# sinusoidi giornaliere
+
+omega <- outer(1:length(lambda_y), 1:6) * 2 * pi / 24 # creo frequenze giornaliera
+cc <- cos(omega) 
+ss <- sin(omega)
+
+# sinusoidi settimanali
+
+omega1 <- outer(1:length(lambda_y), 1:16) * 2 * pi / 168 # creo frequenze ogni settimana
+cc1 <- cos(omega1)
+ss1 <- sin(omega1)
+
+# regressione dummies
+
+reg_dummies <- lm(lambda_y ~ t + t2 + ddummies) 
+
+# regressione sinusoidi
+
+reg_sin <- lm(lambda_y ~ t + t2 + cc1 + ss1) 
+
+# media
+
+level <- reg_sin$coefficients[1] +
+  reg_sin$coefficients[2]*t +
+  reg_sin$coefficients[3]*t2
+level<- level - mean(level) + mean(lambda_y)
+
+# componente sinusoidi
+
+w_sin <- cc1 %*% reg_sin$coefficients[4:19] +
+  ss1 %*% reg_sin$coefficients[20:35]
+
+# componente dummies
+
+w_seas <- ddummies %*% reg_dummies$coefficients[4:6] 
+w_seas <- w_seas - mean(w_seas[1:24])
+
+w_seas <- xts(level+w_seas, df$DT) # trasformo in time series
+w_sin <- xts(level+w_sin, df$DT)
+
+a<-plot(lambda_y[511:1230], type='l', main= 'Stagionalità della serie')
+b<-lines(w_seas[511:1230], col = "green", lwd = 2)
+lines(w_sin[511:1230], col = "red", lwd = 2)
+```
+
+Come già accennato la serie sembra possedere un trend, questa supposizione è confermata anche da un *Augmented Dickey-Fuller unit root test* che, a tal proposito, restituisce un esito positivo.
+
+A questo punto diversi modelli ARIMA sono testati e messi in competizione tra loro; ogni modello proposto si basa sulla serie storica modificata dalla trasformazione di Box-Cox di cui sopra e aggiustata per il bias. Di volta in volta i parametri di ogni modello sono aggiustati in base ai diagrammi di correlazione dei residui ottenuti.
+Il primo di questi gestisce sia il trend che la stagionalità giornaliera mediante una differenziazione stagionale su 24 lags; dopo uno studio dei diagrammi di autocorrelazione e di autocorrelazione parziale il modello ottimale per questo approcio sembra essere un ARIMA(2,0,2)(1,1,1)[24].
+Poi è utilizzato un modello che considera le sinusoidi per modellizzare la stagionalità giornaliera; in particolare esso è un ARIMA(3,0,3)(5,0,3)[24] a cui sono aggiunti i coefficienti delle sei sinusoidi e la media.
+Infine il focus è posto sulla stagionalità settimanale per la quale sono tentati due approci differenti.
+Il primo consiste in un ARIMA(1,0,1)(1,0,1)[24], con costante, a cui sono aggiunti i regressori delle *dummies* per i giorni della settimana. Il secondo è un ARIMA(2,0,2)(3,0,3)[24] con i regressori delle 16 sinusoidi settimanali e l'intercetta. In entrambi i casi la stagionalità settimanale è modellata mediante l'aggiunta di regressori, mentre il periodo del modello stesso è tenuto di 24 ore. Questo deriva tanto dalla volontà, confermata empiricamente, di cogliere il massimo da entrambe le stagionalità, quanto dalle limitazioni computazionali che non permettono di utilizzare adeguatamente i coefficienti AR(p) e MA(q) stagionali con periodi di 168 osservazioni.
+
+Come criterio di valutazione per trovare il modello migliore tra tutti quelli proposti è utilizzato l'AIC corretto. 
+Poi i candidati più promettenti sono addestrati su tutta la serie meno l'ultimo mese (Febbraio 2005) ed utilizzati per prevedere la parte della serie mancante. Avendo le previsioni e i dati reali a cui esse si riferiscono il MAPE (Mean Average Percentage Error) è calcolato; questo è utilizzato come stima della precisione del modello nel prevedere il continuo della serie.
+Dal confronto degli indici AIC i modelli a base di sinusoidi sono quelli che sembrano performare meglio, in particolare quello che impiega 16 sinusoidi per modellare la stagionalità settimanale. 
+Calcolato il MAPE sulle previsioni per Febbraio 2005 per entrambi risulta che il modello con la differenza giornaliera raggiunge un valore di 11.6, mentre quello a base settimanale ottiene un errore di 10.9, quindi, alla fine, avendo raggiunto un errore percentuale più basso quest'ultimo è scelto come modello definitivo.
+E' empiricamente dimostrabile che aggiungere una differenziazione al modello scelto ne abbassa l'efficacia predittiva, quindi, discapito di quanto prima affermato, questo passaggio è scartato.
+Il modello finale risulta quindi essere un ARIMA(2,0,2)(3,0,3)[24] con 16 regressori delle sinusoidi e l'intercetta.
+
+Nel corso della sperimentazione diverse altre variabili *dummies* sono state testate per cercare di migliorare le performance delle previsioni. In particolare è stata creata una variabile contenete le maggiori festività nazionali, come Natale, Capodanno o Pasqua, ma la sua implementazione non si è rivelata particolarmente fruttifera. Anche altri tentativi non hanno prodotto i risultati sperati, come la creazione di una variabile per differenziare i mesi caldi estivi da quelli più freddi invernali o una per cogliere la differenza nelle emissioni tra la notte ed il giorno.
+
+Di seguito sono riportati i diagrammi dell'autocorrelazione e della autocorrelazione parziale per i residui del modello scelto, i grafici si riferiscono ad un intervallo di circa due mesi (60 giorni).
+
+```{r ,echo=FALSE}
+
+mod <- Arima(data_ts, c(2, 0, 2), 
+            list(order = c(3, 0, 3), period = 24),
+            include.mean=TRUE,
+            lambda = 'auto',
+            biasadj = TRUE,
+            xreg = cbind(cc1,ss1))
+
+# AICc= -130729.9
+
+Acf(mod$residuals, 24*60) 
+Pacf(mod$residuals, 24*60)
+
+```
+
+I valori del grafico ACF tendono progressivamente a zero, trend molto evidente se si osservano le correlazioni sulla serie per intero, mentre persistono dei lag significativi nella prima parte del PACF. Questo è dovuto in parte alla ristrettezza delle barre di confidenza, causata dall'alto numero di osservazioni disponibili, ed in parte dalla presenza di una correlazione residuale difficilmente eliminabile con questo tipo di modelli. In generale, comunque, i residui sono sufficientemente simili a quelli di un *White Noise* per poter ritenere il modello soddisfacente. 
+
+Infine si mostrano le previsioni ottenute sull'ultimo mese della serie storica, in blu, confrontate ai valori effettivi, in rosso.
+
+```{r ,echo=FALSE}
+layout(matrix(c(1,1), 1, 1))
+
+mod_test <- Arima(y[1:7854], c(2, 0, 2), 
+              list(order = c(3, 0, 3), period = 24),
+              include.mean=TRUE,
+              lambda = 'auto',
+              biasadj = TRUE,
+              xreg = cbind(cc1,ss1)[1:7854,])
+
+pre_test <- forecast(mod_test, 672, xreg = cbind(cc1, ss1)[7854:8526, ]) # 672 è un mese da 28 giorni (febbraio)
+
+s<-plot(pre_test, 346, main='Previsioni vs Valori reali')
+lines(7854:8526,y[7854:8526], col = "red", type='l')
+
+err_test  <- window(y, start = 7854) - pre_test$mean
+rmse_test <- err_test^2 %>% mean() %>% sqrt()
+mape_test <- mean(abs(err_test)/window(y, start = 7854)*100) # 10.98044
+```
+
+Anche in questo caso si nota la difficoltà del modello ad adattarsi a repentini cambiamenti. In linea generale, però, l'andamento della serie è adeguatamente modellato, con tutte le limitazioni del caso.
+
+A questo punto è possibile prevedere il mese successivo alla fine della serie ed ottenere così i valori richiesti.
+
+```{r ,echo=FALSE}
+
+omega_pre <- outer(1:(length(lambda_y)+744), 1:16) * 2 * pi / 168 # creo frequenze ogni settimana
+cc_pre <- cos(omega_pre)
+ss_pre <- sin(omega_pre)
+pre <- forecast(mod, 744, xreg = cbind(cc_pre, ss_pre)[8527:9270, ]) # previsioni 744 giorni di Marzo
+plot(pre, 346, main='Previsioni per Marzo')
+
+ARIMA = pre$mean
+
+# Scrittura file.csv previsioni 
+Date <-seq(as.Date("2005-03-01"), as.Date("2005-03-31"), by = "day") %>% rep(times=24) %>% sort(Date, decreasing = FALSE)
+Hour <- seq(0 , 23 , by = 1) %>% rep(times=31)
+previsioni <- data.frame(Date, Hour, ARIMA)
+#write.csv(previsioni,"866654_20220613.csv", row.names = FALSE) # save to csv
+
+```
+
+# Modelli UCM
+
+```{r ,echo=FALSE}
+
+# previsioni di prova
+
+data_test <- data_ts
+data_test[7854:8526] <- NA
+
+# previsioni mese compito
+
+data_pre <- rep(NA, length(data_ts)+745)
+data_pre[1:8526] <- data_ts
+data_pre[8527] <- 900
+
+# calcolo MAPE 
+
+losses <- function(y, yhat) {
+  aerr <- abs(y - yhat)
+  c(MAE = mean(aerr),
+    MAPE = mean(aerr/y)*100,
+    RMSE = sqrt(mean(aerr^2)))
+}
+
+```
+
+Il modello UCM scelto per rappresentare la serie è costituito da due componenti: un trend e una stagionalità.
+Il trend risultato migliore è un local linear trend (LLT), attraverso questo, infatti, è permessa un'evoluzione nel tempo sia al coefficiente angolare sia all'intercetta del trend stesso.
+Per quanto riguarda la stagionalità la decisione è ricaduta su una rappresentazione trigonometrica a 16 armoniche, di periodo settimanale e con varianza evolutiva nel tempo.
+
+Per garantire una migliore convergenza del modello non sono usate le matrici inizali di medie e varianze (a1 e P1) a distribuzione difusa, ma i valori al loro interno sono impostati manualmente.
+In particolare, per il valore iniziale dell'intercetta e delle sinusoidi sono utilizzati i coefficienti del modello ARIMA precedentemente addestrato. Per popolare la matrice della varianza iniziale, invece, si è calcolato il valore della varianza totale delle osservazioni. 
+
+Infine è definita una funzione di *update* delle matrici Q e H la quale, partendo da una parametrizzazione iniziale, si occupa della loro evoluzione. Definire questa funzione risulta particolarmente importante nel modello in esame per motivi computazionali. Infatti, avendo impostato una componente stagionale con varianze diverse da zero in Q, il software tenderebbe a trattare l'evoluzione di ogni varianza di ogni sinusoide singolarmente, appesantendo di molto il calcolo. Con il procedimento svolto, invece, si spinge il programma a trattare l'evoluzione di tutte le sinusoidi ugualmente, ottenendo così risultati migliori.
+Per quanto riguarda la parametrizzazione iniziale si sono utilizzate diverse frazioni della variazna totale dei dati, di cui si è poi preso il logaritmo per imporre un segno positivo.
+
+Per essere testato il modello è addestrato su tutta la serie meno l'ultimo mese di dati, poi sono calcolate le previsioni per il mese mancante e confrontate ai valori reali. 
+
+Di seguito è riportata la previsione per l'ultimo mese di dati, in viola, rispetto ai valori effettivi, in nero.
+
+```{r ,echo=FALSE}
+
+mod_test <- SSModel(data_test ~ 0 +
+                  SSMtrend(degree = 2, list(NA, NA)) + # LLT
+                  SSMseasonal(168, NA, "trig", harmonics = 1:16),
+                  data = df,
+                  H = NA
+)
+
+
+vary <- var(data_test, na.rm = TRUE)
+cfs <- coefficients(mod)[12:43]  # Coefficienti modello ARIMA                   
+
+mod_test$a1["level", ] <- coefficients(mod)[11] # Intercetta modello ARIMA 
+mod_test$a1[3:34] <- cfs
+diag(mod_test$P1inf) <- 0
+diag(mod_test$P1[1:2, 1:2]) <- vary
+diag(mod_test$P1[3:34, 3:34]) <- vary 
+
+par_init <- c(
+  log_var_zeta = log(vary/1000),
+  log_var_omega <- log(vary/100),
+  log_var_eps <- log(vary/10),
+  log_var_slope = log(vary/1000)
+)
+
+
+updt1 <- function(pars, model) {
+  model$Q[1, 1, 1] <- exp(pars[1]) 
+  diag(model$Q[3:34, 3:34, 1]) <- exp(pars[2])
+  model$H[1, 1, 1] <- exp(pars[3])
+  model$Q[2, 2, 1] <- exp(pars[4])
+  model
+}
+
+
+fit_test <- fitSSM(mod_test, par_init, updt1)
+smo_test <- KFS(fit_test$model,
+            filtering = c("state","signal"),
+            smoothing = c("state", "disturbance", "signal"))
+
+
+sel <- 7854:8526
+a <- plot(y, type='l', main = 'Previsioni vs Valori reali')
+lines(sel, ts(smo_test$m)[sel], col= 'purple')
+
+```
+
+Uno zoom sui valori predetti consente di valutare meglio l'accuratezza del modello. In generale le previsioni sembrano seguire bene il modello di riferimento, anche se, a volte, sovrastimano leggermente i dati. Il calcolo del MAPE segnala che l'errore del modello è, in media, del 12%.
+
+```{r ,echo=FALSE}
+
+b<-plot(y[sel], type='l', main='Zoom Previsioni vs Valori reali')
+lines(ts(smo_test$m)[sel], col= 'purple')
+
+loss <- losses(y[sel], smo_test$m[sel,]) #11.85
+
+```
+
+Infine il modello validato è riaddetsrato su tutta la serie disponibile ed è utilizzato per prevedere il mese di Marzo 2005.
+Le previsioni ottenute sono riportate nel grafico di seguito in verde.
+
+```{r ,echo=FALSE}
+
+mod_pre <- SSModel(data_pre ~ 0 +
+                  SSMtrend(degree = 2, list(NA, NA)) + # LLT
+                  SSMseasonal(168, NA, "trig", harmonics = 1:16),
+                data = df,
+                H = NA
+)
+
+
+vary <- var(data_pre, na.rm = TRUE)
+cfs <- coefficients(mod)[12:43]  # Coefficienti modello ARIMA                   
+
+mod_pre$a1["level", ] <- coefficients(mod)[11] # Intercetta modello ARIMA 
+mod_pre$a1[3:34] <- cfs
+diag(mod_pre$P1inf) <- 0
+diag(mod_pre$P1[1:2, 1:2]) <- vary
+diag(mod_pre$P1[3:34, 3:34]) <- vary
+
+
+fit_pre<- fitSSM(mod_pre, par_init, updt1)
+smo_pre <- KFS(fit_pre$model,
+                filtering = c("state","signal"),
+                smoothing = c("state", "disturbance", "signal"))
+
+c<-plot(data_pre, type='l', main='Previsioni Marzo 2005')
+lines(8528:9271,smo_pre$m[8528:9271], col= 'green', type='l')
+
+UCM <- smo_pre$m[8528:9271]
+previsioni <- cbind(previsioni, UCM)
+#write.csv(previsioni,"866654_20220613.csv", row.names = FALSE) # save to csv
+
+```
+
+# Modelli Machine Learning
